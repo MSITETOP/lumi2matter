@@ -1,0 +1,457 @@
+"""
+Lightweight Matter Bridge for Lumi Gateway
+Similar to Tasmota Matter implementation - minimal, efficient approach
+"""
+
+import asyncio as aio
+import json
+import logging
+import typing as ty
+from dataclasses import dataclass
+from datetime import datetime
+from zeroconf import ServiceInfo, Zeroconf
+from zeroconf.asyncio import AsyncZeroconf
+import qrcode
+
+from .__version__ import version
+from .button import Button
+from .device import Device
+from .light import Light
+
+logger = logging.getLogger(__name__)
+
+# Matter constants (from Matter spec)
+MATTER_PORT = 5540
+MATTER_VENDOR_ID = 0xFFF1  # Test vendor ID
+MATTER_PRODUCT_ID = 0x8001  # Gateway product
+MATTER_DISCRIMINATOR = 3840  # Default discriminator
+
+
+@dataclass
+class MatterEndpoint:
+    """Matter endpoint representation"""
+    endpoint_id: int
+    device_type: int
+    clusters: ty.List[int]
+    device: Device
+
+
+class MatterDeviceType:
+    """Matter device type IDs"""
+    ROOT_NODE = 0x0016
+    EXTENDED_COLOR_LIGHT = 0x010D  # RGB light with full color control
+    ON_OFF_LIGHT = 0x0100
+    GENERIC_SWITCH = 0x000F  # Momentary switch (button)
+
+
+class MatterCluster:
+    """Matter cluster IDs"""
+    # Common clusters
+    DESCRIPTOR = 0x001D
+    IDENTIFY = 0x0003
+    GROUPS = 0x0004
+    SCENES = 0x0005
+    
+    # Light clusters
+    ON_OFF = 0x0006
+    LEVEL_CONTROL = 0x0008
+    COLOR_CONTROL = 0x0300
+    
+    # Switch clusters
+    SWITCH = 0x003B
+
+
+class LumiMatter:
+    """
+    Lightweight Matter Bridge for Xiaomi Lumi Gateway
+    Implements a minimal Matter server similar to Tasmota approach
+    """
+    
+    def __init__(
+        self,
+        device_id: str,
+        device_name: str,
+        *,
+        vendor_id: int = MATTER_VENDOR_ID,
+        product_id: int = MATTER_PRODUCT_ID,
+        discriminator: int = MATTER_DISCRIMINATOR,
+        passcode: int = 20202021,
+        port: int = MATTER_PORT,
+    ) -> None:
+        self.dev_id = device_id
+        self.device_name = device_name
+        self.vendor_id = vendor_id
+        self.product_id = product_id
+        self.discriminator = discriminator
+        self.passcode = passcode
+        self.port = port
+        
+        # Device storage
+        self.lights: ty.List[Light] = []
+        self.buttons: ty.List[Button] = []
+        self.endpoints: ty.List[MatterEndpoint] = []
+        
+        # Matter service
+        self.zeroconf: ty.Optional[AsyncZeroconf] = None
+        self.service_info: ty.Optional[ServiceInfo] = None
+        
+        # State
+        self._commissioned = False
+        self._fabric_id: ty.Optional[int] = None
+        self._tasks: ty.List[aio.Task] = []
+        
+        # Setup root endpoint (endpoint 0)
+        self._setup_root_endpoint()
+    
+    def _setup_root_endpoint(self):
+        """Setup Matter root node endpoint"""
+        root_endpoint = MatterEndpoint(
+            endpoint_id=0,
+            device_type=MatterDeviceType.ROOT_NODE,
+            clusters=[
+                MatterCluster.DESCRIPTOR,
+                MatterCluster.IDENTIFY,
+            ],
+            device=None
+        )
+        self.endpoints.append(root_endpoint)
+    
+    def register(self, device: Device):
+        """Register a device and create Matter endpoint"""
+        if not device:
+            return
+        
+        endpoint_id = len(self.endpoints)
+        
+        if isinstance(device, Light):
+            # Register as Extended Color Light (RGB)
+            endpoint = MatterEndpoint(
+                endpoint_id=endpoint_id,
+                device_type=MatterDeviceType.EXTENDED_COLOR_LIGHT,
+                clusters=[
+                    MatterCluster.DESCRIPTOR,
+                    MatterCluster.IDENTIFY,
+                    MatterCluster.ON_OFF,
+                    MatterCluster.LEVEL_CONTROL,
+                    MatterCluster.COLOR_CONTROL,
+                ],
+                device=device
+            )
+            self.lights.append(device)
+            self.endpoints.append(endpoint)
+            logger.info(f"Registered RGB Light on endpoint {endpoint_id}")
+            
+        elif isinstance(device, Button):
+            # Register as Generic Switch (momentary button)
+            endpoint = MatterEndpoint(
+                endpoint_id=endpoint_id,
+                device_type=MatterDeviceType.GENERIC_SWITCH,
+                clusters=[
+                    MatterCluster.DESCRIPTOR,
+                    MatterCluster.IDENTIFY,
+                    MatterCluster.SWITCH,
+                ],
+                device=device
+            )
+            self.buttons.append(device)
+            self.endpoints.append(endpoint)
+            logger.info(f"Registered Button on endpoint {endpoint_id}")
+    
+    async def start(self):
+        """Start Matter bridge"""
+        logger.info(f"Starting Matter Bridge for device {self.dev_id}")
+        
+        # Start mDNS service discovery
+        await self._start_mdns()
+        
+        # Start device handlers
+        self._tasks = [
+            aio.create_task(self._handle_buttons()),
+            aio.create_task(self._handle_lights()),
+            aio.create_task(self._handle_commissioning()),
+        ]
+        
+        # Wait for tasks
+        finished, _ = await aio.wait(
+            self._tasks,
+            return_when=aio.FIRST_COMPLETED,
+        )
+        for t in finished:
+            t.result()
+    
+    async def close(self) -> None:
+        """Stop Matter bridge"""
+        logger.info("Stopping Matter Bridge")
+        
+        # Stop mDNS
+        if self.zeroconf:
+            await self._stop_mdns()
+        
+        # Cancel tasks
+        for task in self._tasks:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except aio.CancelledError:
+                    pass
+    
+    async def _start_mdns(self):
+        """Start mDNS advertisement for Matter device discovery"""
+        self.zeroconf = AsyncZeroconf()
+        
+        # Matter service type
+        service_type = "_matter._tcp.local."
+        service_name = f"{self.device_name}.{service_type}"
+        
+        # Matter TXT records for commissioning
+        txt_records = {
+            "D": str(self.discriminator),  # Discriminator
+            "VP": f"{self.vendor_id}+{self.product_id}",  # Vendor+Product
+            "CM": "1" if not self._commissioned else "0",  # Commissioning mode
+            "DT": "65535",  # Device type (bridge)
+            "DN": self.device_name,  # Device name
+            "SII": "5000",  # Sleep Idle Interval
+            "SAI": "300",  # Sleep Active Interval
+        }
+        
+        # Create service info
+        self.service_info = ServiceInfo(
+            type_=service_type,
+            name=service_name,
+            port=self.port,
+            properties=txt_records,
+            server=f"{self.dev_id}.local.",
+        )
+        
+        # Register service
+        await self.zeroconf.async_register_service(self.service_info)
+        logger.info(f"Matter device advertised via mDNS: {service_name}")
+        
+        # Display pairing information
+        self._display_pairing_info()
+    
+    async def _stop_mdns(self):
+        """Stop mDNS advertisement"""
+        if self.service_info:
+            await self.zeroconf.async_unregister_service(self.service_info)
+        await self.zeroconf.async_close()
+    
+    def _generate_qr_code(self) -> str:
+        """Generate Matter QR code payload for pairing"""
+        # Matter QR code format: MT:<base38-encoded-payload>
+        # For simplicity, we'll use the manual pairing code format
+        # Real implementation would encode: Version, VID, PID, Discriminator, Passcode
+        
+        # Manual pairing code format (11 digits): XXXXX-XXXXXX
+        # First 4 digits: discriminator
+        # Last 7 digits: derived from passcode
+        manual_code = f"{self.discriminator:04d}{self.passcode % 10000000:07d}"
+        
+        # Format for display: XXXXX-XXXXXX
+        formatted_code = f"{manual_code[:5]}-{manual_code[5:]}"
+        
+        # Generate QR code payload (simplified)
+        # Real Matter QR uses: MT:Y.K9042C00KA0648G00
+        # For now, we'll encode the manual pairing code
+        qr_payload = f"MT:{formatted_code}"
+        
+        return qr_payload
+    
+    def _display_pairing_info(self):
+        """Display pairing QR code and manual code"""
+        qr_payload = self._generate_qr_code()
+        manual_code = qr_payload.replace("MT:", "")
+        
+        # Generate QR code
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=1,
+            border=2,
+        )
+        qr.add_data(qr_payload)
+        qr.make(fit=True)
+        
+        # Print to console
+        print("\n" + "="*60)
+        print("🔗 MATTER DEVICE PAIRING INFORMATION")
+        print("="*60)
+        print(f"Device Name: {self.device_name}")
+        print(f"Device ID: {self.dev_id}")
+        print(f"Vendor ID: 0x{self.vendor_id:04X}")
+        print(f"Product ID: 0x{self.product_id:04X}")
+        print("-"*60)
+        print(f"📱 Manual Pairing Code: {manual_code}")
+        print(f"🔢 Discriminator: {self.discriminator}")
+        print(f"🔐 Setup PIN: {self.passcode}")
+        print("-"*60)
+        print("📷 QR Code - scan with Yandex Station:")
+        print()
+        
+        # Print QR code to console
+        qr.print_ascii(invert=True)
+        
+        print()
+        print("="*60)
+        print("ℹ️  Instructions:")
+        print("1. Open Yandex Station app")
+        print("2. Go to 'Add Device' -> 'Matter'")
+        print("3. Scan QR code above OR enter manual code")
+        print("4. Follow on-screen instructions")
+        print("="*60)
+        print()
+        
+        logger.info(f"Pairing code: {manual_code}")
+        logger.info(f"QR payload: {qr_payload}")
+    
+    async def _handle_commissioning(self):
+        """Handle Matter commissioning process"""
+        while True:
+            # In a real implementation, this would handle:
+            # 1. PASE (Password Authenticated Session Establishment)
+            # 2. Certificate exchange
+            # 3. Fabric joining
+            # 
+            # For now, we'll simulate commissioning state
+            await aio.sleep(5)
+            
+            # TODO: Implement actual Matter commissioning protocol
+            # This requires handling UDP packets on port 5540
+    
+    async def _handle_buttons(self):
+        """Handle button events and map to Matter Switch cluster"""
+        tasks = [
+            aio.create_task(button.handle(self._on_button_event))
+            for button in self.buttons
+        ]
+        
+        if not tasks:
+            # No buttons, sleep forever
+            await aio.Event().wait()
+            return
+        
+        try:
+            finished, unfinished = await aio.wait(
+                tasks,
+                return_when=aio.FIRST_COMPLETED,
+            )
+        except aio.CancelledError:
+            for t in tasks:
+                t.cancel()
+                try:
+                    await t
+                except aio.CancelledError:
+                    pass
+            raise
+        
+        for t in unfinished:
+            t.cancel()
+            try:
+                await t
+            except aio.CancelledError:
+                pass
+        
+        for t in finished:
+            t.result()
+    
+    async def _on_button_event(self, button: Button, action: str):
+        """Handle button action and send Matter event"""
+        logger.info(f"Button {button.name} action: {action}")
+        
+        # Map button actions to Matter Switch events
+        # Matter Switch cluster supports:
+        # - InitialPress (0x00)
+        # - LongPress (0x01)
+        # - ShortRelease (0x02)
+        # - LongRelease (0x03)
+        # - MultiPressOngoing (0x04)
+        # - MultiPressComplete (0x05)
+        
+        matter_event = self._map_button_action_to_matter(action)
+        
+        # Find endpoint for this button
+        endpoint = next(
+            (ep for ep in self.endpoints if ep.device == button),
+            None
+        )
+        
+        if endpoint:
+            # TODO: Send Matter event notification
+            # In real implementation, this would send to all subscribed controllers
+            logger.debug(
+                f"Matter event on endpoint {endpoint.endpoint_id}: "
+                f"Switch cluster event {matter_event}"
+            )
+    
+    def _map_button_action_to_matter(self, action: str) -> int:
+        """Map lumimqtt button action to Matter Switch event"""
+        mapping = {
+            'single': 0x02,  # ShortRelease
+            'double': 0x05,  # MultiPressComplete (2 presses)
+            'triple': 0x05,  # MultiPressComplete (3 presses)
+            'hold': 0x01,    # LongPress
+            'release': 0x03, # LongRelease
+        }
+        return mapping.get(action, 0x00)
+    
+    async def _handle_lights(self):
+        """Monitor light state changes"""
+        while True:
+            await aio.sleep(1)
+            # Lights are controlled via Matter commands
+            # This task monitors for state changes and updates endpoints
+    
+    async def handle_light_command(
+        self,
+        endpoint_id: int,
+        cluster_id: int,
+        command_id: int,
+        args: dict
+    ):
+        """Handle Matter light control commands"""
+        endpoint = next(
+            (ep for ep in self.endpoints if ep.endpoint_id == endpoint_id),
+            None
+        )
+        
+        if not endpoint or not isinstance(endpoint.device, Light):
+            logger.error(f"Invalid light endpoint: {endpoint_id}")
+            return
+        
+        light: Light = endpoint.device
+        
+        # Handle OnOff cluster (0x0006)
+        if cluster_id == MatterCluster.ON_OFF:
+            if command_id == 0x00:  # Off
+                await light.set({'state': 'OFF'}, 0)
+            elif command_id == 0x01:  # On
+                await light.set({'state': 'ON'}, 0)
+            elif command_id == 0x02:  # Toggle
+                new_state = 'OFF' if light.state['state'] == 'ON' else 'ON'
+                await light.set({'state': new_state}, 0)
+        
+        # Handle LevelControl cluster (0x0008) - Brightness
+        elif cluster_id == MatterCluster.LEVEL_CONTROL:
+            if command_id == 0x00:  # MoveToLevel
+                level = args.get('level', 255)
+                transition = args.get('transition_time', 0) / 10  # Convert to seconds
+                await light.set({'brightness': level}, transition)
+        
+        # Handle ColorControl cluster (0x0300) - RGB Color
+        elif cluster_id == MatterCluster.COLOR_CONTROL:
+            if command_id == 0x47:  # MoveToHueAndSaturation
+                # Convert HSV to RGB
+                hue = args.get('hue', 0)
+                saturation = args.get('saturation', 0)
+                rgb = self._hsv_to_rgb(hue / 254 * 360, saturation / 254 * 100, 100)
+                await light.set({
+                    'color': {'r': rgb[0], 'g': rgb[1], 'b': rgb[2]}
+                }, 0)
+    
+    @staticmethod
+    def _hsv_to_rgb(h: float, s: float, v: float) -> ty.Tuple[int, int, int]:
+        """Convert HSV to RGB (0-255)"""
+        import colorsys
+        r, g, b = colorsys.hsv_to_rgb(h / 360, s / 100, v / 100)
+        return int(r * 255), int(g * 255), int(b * 255)
