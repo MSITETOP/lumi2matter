@@ -19,9 +19,10 @@ setup(
     url='https://github.com/openlumi/lumimqtt/',
     install_requires=[
         'evdev>=1.0.0',
-        'circuitmatter>=1.2.0',
+        'zeroconf>=0.131.0',
         'qrcode>=7.4.2',
         'colorama>=0.4.6',
+        'cryptography>=41.0.0',
     ],
     packages=['lumimqtt'],
     entry_points={

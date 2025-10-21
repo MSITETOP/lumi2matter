@@ -1,6 +1,7 @@
 setuptools_scm
 evdev>=1.0.0
-# Matter dependencies using CircuitMatter (pure Python implementation)
-circuitmatter>=1.2.0
+# Matter lightweight dependencies (similar to Tasmota approach)
 colorama>=0.4.6
+cryptography>=41.0.0
+zeroconf>=0.131.0
 qrcode>=7.4.2
