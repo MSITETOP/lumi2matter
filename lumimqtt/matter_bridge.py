@@ -253,28 +253,58 @@ class LumiMatter:
     def _generate_qr_code(self) -> str:
         """Generate Matter QR code payload for pairing"""
         # Matter QR code format: MT:<base38-encoded-payload>
-        # For simplicity, we'll use the manual pairing code format
-        # Real implementation would encode: Version, VID, PID, Discriminator, Passcode
+        # Payload structure (bits):
+        # Version (3 bits) | VID (16 bits) | PID (16 bits) | 
+        # Custom Flow (2 bits) | Discovery Caps (8 bits) |
+        # Discriminator (12 bits) | Passcode (27 bits)
         
-        # Manual pairing code format (11 digits): XXXXX-XXXXXX
-        # First 4 digits: discriminator
-        # Last 7 digits: derived from passcode
-        manual_code = f"{self.discriminator:04d}{self.passcode % 10000000:07d}"
+        version = 0  # Matter version
+        vid = self.vendor_id
+        pid = self.product_id
+        custom_flow = 0  # Standard commissioning
+        discovery_caps = 0x04  # On Network (BLE=0x01, SoftAP=0x02, OnNetwork=0x04)
+        discriminator = self.discriminator
+        passcode = self.passcode
         
-        # Format for display: XXXXX-XXXXXX
-        formatted_code = f"{manual_code[:5]}-{manual_code[5:]}"
+        # Pack into bits
+        # Total: 3 + 16 + 16 + 2 + 8 + 12 + 27 = 84 bits
+        value = 0
+        value |= (version & 0x7) << 81  # 3 bits at position 81
+        value |= (vid & 0xFFFF) << 65   # 16 bits at position 65
+        value |= (pid & 0xFFFF) << 49   # 16 bits at position 49
+        value |= (custom_flow & 0x3) << 47  # 2 bits at position 47
+        value |= (discovery_caps & 0xFF) << 39  # 8 bits at position 39
+        value |= (discriminator & 0xFFF) << 27  # 12 bits at position 27
+        value |= (passcode & 0x7FFFFFF)  # 27 bits at position 0
         
-        # Generate QR code payload (simplified)
-        # Real Matter QR uses: MT:Y.K9042C00KA0648G00
-        # For now, we'll encode the manual pairing code
-        qr_payload = f"MT:{formatted_code}"
+        # Convert to base-38 encoded string
+        base38_chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-."
+        encoded = ""
+        
+        # Encode the value in base-38
+        temp_value = value
+        while temp_value > 0:
+            encoded = base38_chars[temp_value % 38] + encoded
+            temp_value //= 38
+        
+        # Pad to ensure minimum length (should be ~15-20 chars for Matter QR)
+        while len(encoded) < 20:
+            encoded = "0" + encoded
+        
+        # Matter QR code format
+        qr_payload = f"MT:{encoded}"
         
         return qr_payload
     
     def _display_pairing_info(self):
         """Display pairing QR code and manual code"""
         qr_payload = self._generate_qr_code()
-        manual_code = qr_payload.replace("MT:", "")
+        
+        # Generate manual pairing code (11 digits)
+        # Matter format: XXXX-XXX-XXXX (as expected by Yandex Station)
+        manual_code_value = self.passcode
+        manual_code_str = f"{manual_code_value:011d}"  # Pad to 11 digits
+        manual_code = f"{manual_code_str[0:4]}-{manual_code_str[4:7]}-{manual_code_str[7:11]}"
         
         # Generate QR code
         qr = qrcode.QRCode(
@@ -292,14 +322,16 @@ class LumiMatter:
         print("="*60)
         print(f"Device Name: {self.device_name}")
         print(f"Device ID: {self.dev_id}")
-        print(f"Vendor ID: 0x{self.vendor_id:04X}")
-        print(f"Product ID: 0x{self.product_id:04X}")
+        print(f"Vendor ID: 0x{self.vendor_id:04X} ({self.vendor_id})")
+        print(f"Product ID: 0x{self.product_id:04X} ({self.product_id})")
         print("-"*60)
         print(f"📱 Manual Pairing Code: {manual_code}")
+        print(f"   (Enter in Yandex Station as XXXX-XXX-XXXX)")
         print(f"🔢 Discriminator: {self.discriminator}")
         print(f"🔐 Setup PIN: {self.passcode}")
         print("-"*60)
         print("📷 QR Code - scan with Yandex Station:")
+        print(f"QR Payload: {qr_payload}")
         print()
         
         # Print QR code to console
@@ -310,12 +342,13 @@ class LumiMatter:
         print("ℹ️  Instructions:")
         print("1. Open Yandex Station app")
         print("2. Go to 'Add Device' -> 'Matter'")
-        print("3. Scan QR code above OR enter manual code")
-        print("4. Follow on-screen instructions")
+        print("3. OPTION A: Scan QR code above")
+        print(f"4. OPTION B: Enter manual code: {manual_code}")
+        print("5. Follow on-screen instructions")
         print("="*60)
         print()
         
-        logger.info(f"Pairing code: {manual_code}")
+        logger.info(f"Manual pairing code (XXXX-XXX-XXXX format): {manual_code}")
         logger.info(f"QR payload: {qr_payload}")
     
     async def _handle_commissioning(self):
