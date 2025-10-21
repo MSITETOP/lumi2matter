@@ -1,5 +1,6 @@
 .venv
 .idea
+.qoder
 lumimqtt.json
 build
 dist
