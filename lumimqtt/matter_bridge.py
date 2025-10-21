@@ -12,6 +12,8 @@ from datetime import datetime
 from zeroconf import ServiceInfo, Zeroconf
 from zeroconf.asyncio import AsyncZeroconf
 import qrcode
+import socket
+import struct
 
 from .__version__ import version
 from .button import Button
@@ -100,6 +102,10 @@ class LumiMatter:
         self._fabric_id: ty.Optional[int] = None
         self._tasks: ty.List[aio.Task] = []
         
+        # UDP server for Matter protocol
+        self._udp_transport: ty.Optional[aio.DatagramTransport] = None
+        self._udp_protocol: ty.Optional['MatterUDPProtocol'] = None
+        
         # Setup root endpoint (endpoint 0)
         self._setup_root_endpoint()
     
@@ -161,6 +167,9 @@ class LumiMatter:
         """Start Matter bridge"""
         logger.info(f"Starting Matter Bridge for device {self.dev_id}")
         
+        # Start UDP server for Matter protocol
+        await self._start_udp_server()
+        
         # Start mDNS service discovery
         await self._start_mdns()
         
@@ -182,6 +191,10 @@ class LumiMatter:
     async def close(self) -> None:
         """Stop Matter bridge"""
         logger.info("Stopping Matter Bridge")
+        
+        # Stop UDP server
+        if self._udp_transport:
+            self._udp_transport.close()
         
         # Stop mDNS
         if self.zeroconf:
@@ -455,3 +468,160 @@ class LumiMatter:
         import colorsys
         r, g, b = colorsys.hsv_to_rgb(h / 360, s / 100, v / 100)
         return int(r * 255), int(g * 255), int(b * 255)
+    
+    async def _start_udp_server(self):
+        """Start UDP server for Matter protocol on port 5540"""
+        loop = aio.get_running_loop()
+        
+        # Create UDP endpoint
+        self._udp_protocol = MatterUDPProtocol(self)
+        transport, protocol = await loop.create_datagram_endpoint(
+            lambda: self._udp_protocol,
+            local_addr=('0.0.0.0', self.port)
+        )
+        self._udp_transport = transport
+        
+        logger.info(f"Matter UDP server started on port {self.port}")
+
+
+class MatterUDPProtocol(aio.DatagramProtocol):
+    """UDP protocol handler for Matter messages"""
+    
+    def __init__(self, bridge: LumiMatter):
+        self.bridge = bridge
+        self.transport: ty.Optional[aio.DatagramTransport] = None
+    
+    def connection_made(self, transport):
+        self.transport = transport
+        logger.debug("Matter UDP protocol ready")
+    
+    def datagram_received(self, data: bytes, addr: ty.Tuple[str, int]):
+        """Handle incoming Matter UDP packets"""
+        logger.info(f"Received Matter packet from {addr[0]}:{addr[1]}, size: {len(data)} bytes")
+        
+        # Parse Matter message
+        try:
+            message = self._parse_matter_message(data)
+            logger.debug(f"Matter message: {message}")
+            
+            # Handle message based on type
+            response = self._handle_matter_message(message, addr)
+            
+            if response:
+                # Send response
+                self.transport.sendto(response, addr)
+                logger.debug(f"Sent Matter response to {addr[0]}:{addr[1]}, size: {len(response)} bytes")
+        
+        except Exception as e:
+            logger.error(f"Error processing Matter message: {e}", exc_info=True)
+    
+    def _parse_matter_message(self, data: bytes) -> dict:
+        """Parse Matter protocol message (simplified)"""
+        if len(data) < 8:
+            raise ValueError("Message too short")
+        
+        # Matter message structure (simplified):
+        # Byte 0: Message flags
+        # Byte 1-2: Session ID
+        # Byte 3: Security flags
+        # Byte 4-7: Message counter
+        # Byte 8+: Payload
+        
+        flags = data[0]
+        session_id = struct.unpack('<H', data[1:3])[0]
+        security_flags = data[3]
+        message_counter = struct.unpack('<I', data[4:8])[0]
+        payload = data[8:]
+        
+        return {
+            'flags': flags,
+            'session_id': session_id,
+            'security_flags': security_flags,
+            'message_counter': message_counter,
+            'payload': payload,
+        }
+    
+    def _handle_matter_message(self, message: dict, addr: ty.Tuple[str, int]) -> ty.Optional[bytes]:
+        """Handle Matter message and generate response"""
+        
+        # Check if this is a commissioning message (session_id = 0)
+        if message['session_id'] == 0:
+            logger.info("Received commissioning message")
+            return self._handle_commissioning_message(message, addr)
+        
+        # Handle other messages
+        logger.debug(f"Received operational message on session {message['session_id']}")
+        return None
+    
+    def _handle_commissioning_message(self, message: dict, addr: ty.Tuple[str, int]) -> bytes:
+        """Handle PASE commissioning message (simplified)"""
+        
+        payload = message['payload']
+        
+        # Try to parse Protocol Opcode from payload
+        if len(payload) < 4:
+            logger.warning("Commissioning payload too short")
+            return self._build_status_response(message, status=0x01)  # Failure
+        
+        # Extract protocol opcode (byte 0-1 of secure channel protocol)
+        # This is very simplified - real implementation would parse TLV structure
+        
+        logger.info(f"Processing PASE commissioning (payload size: {len(payload)} bytes)")
+        
+        # For now, send a simple acknowledgment
+        # Real implementation would:
+        # 1. Parse PBKDFParamRequest
+        # 2. Send PBKDFParamResponse
+        # 3. Handle Pake1, Pake2, Pake3 messages
+        # 4. Establish secure session
+        
+        # Send basic acknowledgment
+        return self._build_pase_response(message)
+    
+    def _build_pase_response(self, request: dict) -> bytes:
+        """Build PASE response message (very simplified)"""
+        
+        # Build Matter message header
+        flags = 0x00  # Unsecured message
+        session_id = 0  # Commissioning session
+        security_flags = 0x00
+        message_counter = request['message_counter'] + 1
+        
+        # Very basic payload - real implementation would include:
+        # - PBKDF parameters (iterations, salt)
+        # - PAKE verifier
+        # - Session parameters
+        
+        # For now, send minimal response to show we're listening
+        payload = b'\x15\x30\x01\x00'  # Minimal TLV structure
+        
+        # Pack message
+        response = struct.pack('<BHB', flags, session_id, security_flags)
+        response += struct.pack('<I', message_counter)
+        response += payload
+        
+        logger.info("Sent PASE response (simplified)")
+        return response
+    
+    def _build_status_response(self, request: dict, status: int) -> bytes:
+        """Build status response message"""
+        
+        flags = 0x00
+        session_id = request['session_id']
+        security_flags = 0x00
+        message_counter = request['message_counter'] + 1
+        
+        # Status report payload
+        payload = struct.pack('<B', status)
+        
+        response = struct.pack('<BHB', flags, session_id, security_flags)
+        response += struct.pack('<I', message_counter)
+        response += payload
+        
+        return response
+    
+    def error_received(self, exc):
+        logger.error(f"UDP error: {exc}")
+    
+    def connection_lost(self, exc):
+        logger.info("Matter UDP protocol closed")
